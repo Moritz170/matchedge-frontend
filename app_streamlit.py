@@ -146,6 +146,44 @@ def load_automated_nfl_matchday(target_week: Optional[int] = None) -> Tuple[List
 
 
 # =============================================================================
+# AUTOMATED NBA DATA ENGINE (DAILY SLATE & VALUATION)
+# =============================================================================
+
+@st.cache_data(ttl=900)  # Automatically re-evaluates every 15 minutes
+def load_automated_nba_slate(target_date: Optional[str] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str]:
+    """Loads NBA daily slate data with attack/defense valuation, pace, and injury factors."""
+    try:
+        from ucl_dixon_coles.nba.pipeline import NBAPipeline
+        pipeline = NBAPipeline(date=target_date)
+        pipeline.ingest_inputs()
+        val_df = pipeline.run_valuation()
+        pipeline.save_outputs()
+
+        # Auto-reconcile completed games
+        recon_summary = pipeline.reconcile_completed_games()
+
+        # Silently attempt Supabase sync in background
+        try:
+            pipeline.sync_to_supabase()
+        except Exception:
+            pass
+
+        records = val_df.to_dict(orient="records")
+        return records, recon_summary, pipeline.date_str or "2026-10-03"
+
+    except Exception as e:
+        fallback_file = UCL_ROOT / "outputs" / "nba" / "nba_valuation_latest.json"
+        if fallback_file.exists():
+            try:
+                with open(fallback_file, "r") as f:
+                    data = json.load(f)
+                    return data, {"reconciled_count": 0}, target_date or "2026-10-03"
+            except Exception:
+                pass
+        return [], {"error": str(e)}, target_date or "2026-10-03"
+
+
+# =============================================================================
 # FOOTBALL (SOCCER) DATA LOADERS
 # =============================================================================
 
@@ -182,7 +220,7 @@ st.sidebar.markdown("**Live Quantitative Betting Engine**")
 
 sport_choice = st.sidebar.radio(
     "Choose Sport Pipeline:",
-    ["🏈 NFL American Football", "⚽ European Football"],
+    ["🏀 NBA Basketball", "🏈 NFL American Football", "⚽ European Football"],
     index=0,
 )
 
@@ -201,10 +239,247 @@ if st.sidebar.button("🔄 Force Live Refresh Now"):
 
 
 # =============================================================================
-# VIEW 1: NFL AMERICAN FOOTBALL (UPCOMING-FIRST BETTING VIEW)
+# VIEW 1: NBA BASKETBALL (DAILY SLATE & VALUATION VIEW)
 # =============================================================================
 
-if "NFL" in sport_choice:
+if "NBA" in sport_choice:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("📅 NBA Slate Controls")
+    slate_choice = st.sidebar.selectbox(
+        "Select NBA Slate:",
+        [
+            "⚡ Auto (Next Upcoming Slate)",
+            "Active Slate (2026-10-03)",
+        ],
+        index=0,
+    )
+    selected_date = None if "Auto" in slate_choice else "2026-10-03"
+
+    with st.spinner("🤖 Auto-loading upcoming NBA slate, live odds, and injury reports..."):
+        nba_records, recon_info, cur_date = load_automated_nba_slate(target_date=selected_date)
+
+    st.title(f"🏀 MatchEdge NBA — Slate for {cur_date}")
+    st.markdown(
+        f"**Live Quantitative NBA Betting Feed** • Evaluated **{len(nba_records)} matchups** with team power ratings, "
+        "attack/defense valuations, tempo/pace, and injury adjustments."
+    )
+
+    if not nba_records:
+        st.warning("No NBA games found for this slate date. Try forcing a live refresh or selecting another date.")
+    else:
+        df_nba = pd.DataFrame(nba_records)
+
+        upcoming_rows = [r for r in nba_records if r.get("status") != "STATUS_FINAL"]
+        upcoming_rows.sort(key=lambda x: (x.get("starts_in_hours") is None, x.get("starts_in_hours") or 9999))
+        finished_rows = [r for r in nba_records if r.get("status") == "STATUS_FINAL"]
+
+        # Overview Metrics Row
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Upcoming Games to Bet", len(upcoming_rows), delta=f"{len(upcoming_rows)} unplayed")
+        with col2:
+            spread_edges = len([r for r in upcoming_rows if r.get("spread_pick") in ["HOME", "AWAY"]])
+            st.metric("Actionable Spread Bets", spread_edges)
+        with col3:
+            total_edges = len([r for r in upcoming_rows if r.get("total_pick") in ["OVER", "UNDER"]])
+            st.metric("Actionable Total Bets", total_edges)
+        with col4:
+            avg_score = round(float(df_nba["matchedge_score"].mean()), 1) if "matchedge_score" in df_nba.columns else 0.0
+            st.metric("Avg MatchEdge Score", f"{avg_score} / 10")
+
+        st.markdown("---")
+
+        tabs = st.tabs([
+            "⚡ Next Upcoming Games to Bet On",
+            "📋 Full NBA Slate & Deep Table",
+            "🏆 Completed Results & Graded ROI",
+            "📊 NBA Team Power Ratings & Standings",
+        ])
+
+        # TAB 1: NEXT UPCOMING GAMES TO BET ON
+        with tabs[0]:
+            if not upcoming_rows:
+                st.info(f"All games for {cur_date} are completed! Check completed results or next slate.")
+            else:
+                f_col1, f_col2 = st.columns([1, 2])
+                with f_col1:
+                    filter_choice = st.selectbox(
+                        "Filter Upcoming Games:",
+                        ["All Upcoming Games", "Top Value Picks (Score >= 8.5)", "Point Spread Only", "Game Total Only"],
+                    )
+
+                display_upcoming = upcoming_rows
+                if filter_choice == "Top Value Picks (Score >= 8.5)":
+                    display_upcoming = [r for r in upcoming_rows if r.get("matchedge_score", 0) >= 8.5]
+                elif filter_choice == "Point Spread Only":
+                    display_upcoming = [r for r in upcoming_rows if r.get("spread_pick") in ["HOME", "AWAY"]]
+                elif filter_choice == "Game Total Only":
+                    display_upcoming = [r for r in upcoming_rows if r.get("total_pick") in ["OVER", "UNDER"]]
+
+                st.caption(f"Showing **{len(display_upcoming)} upcoming games** sorted by earliest tip-off:")
+
+                for row in display_upcoming:
+                    h_team = row.get("home_team", "Home")
+                    a_team = row.get("away_team", "Away")
+                    h_abbr = row.get("home_team_abbr", "HOM")
+                    a_abbr = row.get("away_team_abbr", "AWY")
+                    g_date = str(row.get("kickoff_formatted") or row.get("game_date", ""))[:16]
+                    score = row.get("matchedge_score", 5.0)
+                    verdict = row.get("verdict", "")
+                    starts_h = row.get("starts_in_hours")
+
+                    # Countdown badge
+                    if starts_h is not None:
+                        if starts_h > 24:
+                            days = round(starts_h / 24.0, 1)
+                            time_badge = f"⏳ Tip-off in {days} days"
+                        elif starts_h > 0:
+                            time_badge = f"⏳ Tip-off in {starts_h:.1f} hours"
+                        else:
+                            time_badge = "🔴 Live / Tip-off imminent"
+                    else:
+                        time_badge = "⏱️ Scheduled"
+
+                    with st.expander(
+                        f"**{a_team} ({a_abbr}) @ {h_team} ({h_abbr})** — `{time_badge}` — MatchEdge Score: **{score}/10**",
+                        expanded=True,
+                    ):
+                        c1, c2, c3 = st.columns([1.2, 1.2, 1.6])
+
+                        with c1:
+                            st.markdown("#### 🎯 Point Spread Market")
+                            m_spread = row.get("market_spread")
+                            p_spread = row.get("projected_spread")
+                            sp_pick = row.get("spread_pick", "PASS")
+                            sp_edge = row.get("spread_edge", 0.0)
+                            sp_kelly = row.get("spread_kelly", 0.0)
+
+                            st.write(f"• **Market Line:** `{m_spread:+.1f}`" if m_spread is not None else "• **Market Line:** N/A")
+                            st.write(f"• **Model Fair Spread:** `{p_spread:+.1f}`" if p_spread is not None else "• **Model Fair Spread:** N/A")
+                            if sp_pick != "PASS":
+                                pick_team = h_abbr if sp_pick == "HOME" else a_abbr
+                                st.success(f"**TARGET: {pick_team}** (+{sp_edge * 100:.1f}% EV)")
+                                st.caption(f"Quarter-Kelly Stake: **{sp_kelly * 100:.1f}% of bankroll**")
+                            else:
+                                st.info("Pick: PASS (Line is fair)")
+
+                        with c2:
+                            st.markdown("#### ⚖️ Over / Under Total")
+                            m_tot = row.get("market_total")
+                            p_tot = row.get("projected_total")
+                            t_pick = row.get("total_pick", "PASS")
+                            t_edge = row.get("total_edge", 0.0)
+                            t_kelly = row.get("total_kelly", 0.0)
+
+                            st.write(f"• **Market Total:** `{m_tot:.1f}`" if m_tot is not None else "• **Market Total:** N/A")
+                            st.write(f"• **Model Projected Total:** `{p_tot:.1f}`" if p_tot is not None else "• **Model Projected Total:** N/A")
+                            if t_pick != "PASS":
+                                st.success(f"**TARGET: {t_pick} {m_tot}** (+{t_edge * 100:.1f}% EV)")
+                                st.caption(f"Quarter-Kelly Stake: **{t_kelly * 100:.1f}% of bankroll**")
+                            else:
+                                st.info("Pick: PASS (Total is fair)")
+
+                        with c3:
+                            st.markdown("#### 🏀 Matchup Ratings & Pace")
+                            h_ortg = row.get("home_offense_rating", 0.0)
+                            h_drtg = row.get("home_defense_rating", 0.0)
+                            a_ortg = row.get("away_offense_rating", 0.0)
+                            a_drtg = row.get("away_defense_rating", 0.0)
+                            pace = row.get("projected_pace", 99.2)
+                            venue = row.get("venue_name", "Arena")
+
+                            st.write(f"• **{h_abbr}**: Attack `{h_ortg:+.1f}` | Defense `{h_drtg:+.1f}`")
+                            st.write(f"• **{a_abbr}**: Attack `{a_ortg:+.1f}` | Defense `{a_drtg:+.1f}`")
+                            st.write(f"• **Projected Pace:** `{pace:.1f}` poss/48m")
+                            st.write(f"• **Venue:** {venue}")
+                            st.write(f"• **Verdict:** *{verdict}*")
+
+                        # Tactical advantage breakdown
+                        why_pts = row.get("why_points", [])
+                        if isinstance(why_pts, str):
+                            try:
+                                why_pts = json.loads(why_pts)
+                            except Exception:
+                                why_pts = [why_pts]
+                        if why_pts:
+                            st.markdown("**Tactical Advantage Breakdown:**")
+                            for pt in why_pts:
+                                st.markdown(f"- {pt}")
+
+        # TAB 2: FULL NBA SLATE & DEEP TABLE
+        with tabs[1]:
+            st.subheader(f"Complete Evaluated Slate — {cur_date}")
+            cols_show = [
+                "game_date", "away_team_abbr", "home_team_abbr", "status",
+                "market_spread", "projected_spread", "spread_pick", "spread_edge",
+                "market_total", "projected_total", "total_pick", "total_edge",
+                "p_home_win", "p_away_win", "matchedge_score", "verdict"
+            ]
+            exist = [c for c in cols_show if c in df_nba.columns]
+            st.dataframe(df_nba[exist], hide_index=True, width="stretch")
+
+        # TAB 3: COMPLETED RESULTS & GRADED ROI
+        with tabs[2]:
+            st.subheader("📊 Automated NBA Results Reconciliation & Accuracy Tracking")
+            st.markdown(
+                "When games conclude, official final scores are automatically ingested from ESPN and every bet is graded "
+                "Against the Spread (ATS), Over/Under, and Moneyline."
+            )
+            r_col1, r_col2, r_col3, r_col4 = st.columns(4)
+            with r_col1:
+                st.metric("Games Graded This Slate", recon_info.get("reconciled_count", 0))
+            with r_col2:
+                st.metric("Spread Record", recon_info.get("spread_record", "0-0"))
+            with r_col3:
+                pnl = recon_info.get("net_pnl_units", 0.0)
+                st.metric("Net Profit / Loss", f"{pnl:+.2f} Units", delta=f"{pnl:+.2f}")
+            with r_col4:
+                brier = recon_info.get("brier_score")
+                st.metric("Brier Calibration Score", f"{brier:.4f}" if brier else "N/A")
+
+            # Check if cumulative reconciliation CSV exists
+            recon_csv = UCL_ROOT / "outputs" / "nba" / "nba_reconciliation_cumulative.csv"
+            if recon_csv.exists():
+                try:
+                    df_recon = pd.read_csv(recon_csv)
+                    st.markdown("#### Cumulative Graded Outcomes & Bets")
+                    st.dataframe(df_recon, hide_index=True, width="stretch")
+                except Exception:
+                    pass
+
+        # TAB 4: NBA TEAM POWER RATINGS & STANDINGS
+        with tabs[3]:
+            st.subheader("📊 30 NBA Franchises — Attack, Defense & Net Power Ratings")
+            st.markdown(
+                "Every franchise is calibrated using regular season advanced boxscores, offensive rating (points per 100 poss above avg), "
+                "defensive rating (points prevented below avg), and tactical tempo/pace."
+            )
+            try:
+                from ucl_dixon_coles.nba.ratings_engine import BASE_NBA_TEAM_RATINGS
+                ratings_list = []
+                for abbr, r in BASE_NBA_TEAM_RATINGS.items():
+                    net_power = round(r["offense"] + r["defense"], 2)
+                    ratings_list.append({
+                        "Franchise": r["name"],
+                        "Abbr": abbr,
+                        "Net Power Rating": net_power,
+                        "Attack (ORTG)": r["offense"],
+                        "Defense (DRTG)": r["defense"],
+                        "Game Pace": r["pace"],
+                        "eFG%": r.get("efg", 0.54),
+                        "Altitude Venue": "🏔️ High Altitude (+3.5 pts)" if abbr in ["DEN", "UTAH"] else "Standard"
+                    })
+                df_ratings = pd.DataFrame(ratings_list).sort_values("Net Power Rating", ascending=False)
+                st.dataframe(df_ratings, hide_index=True, width="stretch")
+            except Exception as e:
+                st.error(f"Could not load team ratings: {e}")
+
+
+# =============================================================================
+# VIEW 2: NFL AMERICAN FOOTBALL (UPCOMING-FIRST BETTING VIEW)
+# =============================================================================
+
+elif "NFL" in sport_choice:
     # Matchday Selector in sidebar or top
     st.sidebar.markdown("---")
     st.sidebar.subheader("📅 Matchday Controls")
